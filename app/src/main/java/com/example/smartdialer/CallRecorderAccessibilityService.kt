@@ -5,6 +5,8 @@ import android.content.Context
 import android.media.AudioManager
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.telephony.PhoneStateListener
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
@@ -72,35 +74,78 @@ class CallRecorderAccessibilityService : AccessibilityService() {
         }
     }
 
+    private val handler = Handler(Looper.getMainLooper())
+    private var onWaCallScreen = false
+    private var waCallFinished = false
+    private var audioMissCount = 0
+    private val callTimerRegex = Regex("^\\d{1,2}:\\d{2}(:\\d{2})?$")
+
+    // WhatsApp call chal rahi hai ya nahi, ye audio mode se pata chalta hai
+    private val waCallPoller = object : Runnable {
+        override fun run() {
+            if (!(isRecording && currentRecordType.startsWith("WhatsApp"))) return
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (am.mode == AudioManager.MODE_IN_COMMUNICATION) audioMissCount = 0 else audioMissCount++
+            if (audioMissCount >= 3) {
+                finishWhatsAppRecording()
+            } else {
+                handler.postDelayed(this, 1500)
+            }
+        }
+    }
+
+    private fun finishWhatsAppRecording() {
+        handler.removeCallbacks(waCallPoller)
+        stopRecording()
+        lastWhatsAppCaller = "Unknown"
+        waCallFinished = true
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val prefs = getSharedPreferences("dialer_prefs", Context.MODE_PRIVATE)
         if (!prefs.getBoolean("auto_wa_rec", true)) return
 
         val pkg = event.packageName?.toString() ?: ""
-        if (pkg == "com.whatsapp" || pkg == "com.whatsapp.w4b") {
-            val rawTexts = event.text.mapNotNull { it?.toString()?.trim() }
-            val eventText = rawTexts.joinToString(" ").lowercase(Locale.ROOT)
-            val className = event.className?.toString()?.lowercase(Locale.ROOT) ?: ""
+        if (pkg != "com.whatsapp" && pkg != "com.whatsapp.w4b") return
 
-            extractWhatsAppCallerName(rootInActiveWindow, rawTexts)?.let { detectedName ->
-                lastWhatsAppCaller = detectedName
-            }
+        val className = event.className?.toString()?.lowercase(Locale.ROOT) ?: ""
 
-            val isVoipScreen = className.contains("voip") || className.contains("call")
-            val isOngoingCallText = eventText.contains("ongoing voice call") ||
-                    eventText.contains("ongoing video call") ||
-                    eventText.contains("whatsapp call")
+        // Nayi window khulne par pata chalta hai ki call screen hai ya nahi
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            onWaCallScreen = className.contains("voip") || className.contains("calling")
+            if (onWaCallScreen) waCallFinished = false
+        }
 
-            val isCallEndedText = eventText.contains("call ended") ||
-                    eventText.contains("declined") ||
-                    eventText.contains("unanswered")
+        val rawTexts = event.text.mapNotNull { it?.toString()?.trim() }
+        val eventText = rawTexts.joinToString(" ").lowercase(Locale.ROOT)
+        val isCallEndedText = eventText.contains("call ended") ||
+                eventText.contains("declined") ||
+                eventText.contains("unanswered")
 
-            if ((isVoipScreen || isOngoingCallText) && !isRecording && !isCallEndedText) {
-                startRecording("WhatsApp_Call")
-            } else if (isCallEndedText && isRecording && currentRecordType.startsWith("WhatsApp")) {
-                stopRecording()
-                lastWhatsAppCaller = "Unknown"
+        if (isCallEndedText && isRecording && currentRecordType.startsWith("WhatsApp")) {
+            finishWhatsAppRecording()
+            return
+        }
+
+        if (!onWaCallScreen || waCallFinished) return
+
+        val texts = mutableListOf<String>()
+        texts.addAll(rawTexts)
+        collectNodeTexts(rootInActiveWindow, texts)
+
+        extractWhatsAppCallerName(rootInActiveWindow, rawTexts)?.let { detectedName ->
+            lastWhatsAppCaller = detectedName
+        }
+
+        // Recording sirf tab shuru hogi jab call timer (00:01 jaisa) screen par chalne lage
+        val timerVisible = texts.any { callTimerRegex.matches(it.trim()) }
+        if (timerVisible && !isRecording) {
+            startRecording("WhatsApp_Call")
+            if (isRecording) {
+                audioMissCount = 0
+                handler.removeCallbacks(waCallPoller)
+                handler.postDelayed(waCallPoller, 3000)
             }
         }
     }
@@ -215,6 +260,7 @@ class CallRecorderAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
+        handler.removeCallbacks(waCallPoller)
         stopRecording()
     }
 }
