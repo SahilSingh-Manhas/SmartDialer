@@ -1,0 +1,7 @@
+*.db
+*.jks
+*.keystore
+.env
+build/
+.gradle/
+local.properties
